@@ -1,0 +1,1 @@
+from ._internal._already_wrapped_gpu import WrappedBinaryClassifierXGB_GPU, WrappedRegressorXGB_GPU
