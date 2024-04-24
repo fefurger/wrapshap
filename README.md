@@ -16,6 +16,8 @@ pip install .[gpu]
 
 You should now be able to import wrapshap utilities.
 
+## **Warning: If you are enconring import issues, please try using Python version 3.9**
+
 ### For the CPU implementation:
 
 ```python
