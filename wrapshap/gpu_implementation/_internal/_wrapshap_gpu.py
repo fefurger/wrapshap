@@ -385,7 +385,10 @@ def _select_top(top, shap_train, features):
 
 
 def _calculate_r2(y_true, y_pred):
-
+    
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
+    
     y_pred = tf.reshape(y_pred, tf.shape(y_true))
     ss_res = tf.reduce_sum(tf.square(y_true - y_pred), axis=1)
     y_true_mean = tf.reduce_mean(y_true, axis=1, keepdims=True)
