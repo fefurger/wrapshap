@@ -12,12 +12,12 @@ This module provides the core class of the GPU implementation of the wrapshap pa
 from ..wrapshap import Wrapshap
 from ..wrapshap import get_surrogate_metrics
 from ._internal._wrapshap_gpu import shapFFS, shapBFE, shapNCK, shapXFFS
-from ._internal._wrapshap_gpu import print_XFFS_tree
+from ._internal._wrapshap_gpu import print_XFFS_tree, plot_XFFS_tree
 
 
 class WrapshapGPU(Wrapshap):
 
-    def shapFFS(self, surrogate_metrics: bool = False, top: int = None):
+    def shapFFS(self, surrogate_metrics: bool = False, top: int = None, plot:bool = True, time_info:bool = True):
         """
         Wrapshap GPU implementation of Forward Feature Selection (FFS). 
 
@@ -33,9 +33,13 @@ class WrapshapGPU(Wrapshap):
 
         ranking, perfs = shapFFS(
             shap_train=self.shap_train,
+            shap_test = self.shap_test,
             y_pred_train=self.y_pred_train,
+            y_pred_test= self.y_pred_test,
             feature_names=self.feature_names,
-            top=top            
+            top=top,
+            plot=plot, 
+            time_info=time_info            
         )
         if surrogate_metrics:
             perfs = get_surrogate_metrics(
@@ -53,7 +57,7 @@ class WrapshapGPU(Wrapshap):
         return ranking, perfs
     
 
-    def shapBFE(self, surrogate_metrics: bool = False, top: int = None):
+    def shapBFE(self, surrogate_metrics: bool = False, top: int = None, plot:bool = True, time_info:bool = True):
         """
         Wrapshap GPU implementation of Backward Feature Elimination (BFE). 
 
@@ -69,9 +73,13 @@ class WrapshapGPU(Wrapshap):
         
         ranking, perfs = shapBFE(
             shap_train=self.shap_train,
+            shap_test = self.shap_test,
             y_pred_train=self.y_pred_train,
+            y_pred_test= self.y_pred_test,
             feature_names=self.feature_names,
-            top=top            
+            top=top,
+            plot=plot, 
+            time_info=time_info            
         )
         if surrogate_metrics:
             perfs = get_surrogate_metrics(
@@ -111,6 +119,8 @@ class WrapshapGPU(Wrapshap):
         return shapNCK(
             shap_train=self.shap_train,
             y_pred_train=self.y_pred_train,
+            shap_test=self.shap_test,
+            y_pred_test= self.y_pred_test,
             feature_names=self.feature_names,
             k=k,
             batch_size=batch_size,
@@ -137,7 +147,9 @@ class WrapshapGPU(Wrapshap):
 
         return shapXFFS(
             shap_train=self.shap_train,
+            shap_test = self.shap_test,
             y_pred_train=self.y_pred_train,
+            y_pred_test= self.y_pred_test,
             feature_names=self.feature_names,
             n=n,
             max_depth=max_depth,

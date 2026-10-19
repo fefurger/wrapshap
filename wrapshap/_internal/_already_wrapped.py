@@ -132,7 +132,7 @@ class WrappedXGB(ABC):
         self.shap_test = self.model.predict(xgb.DMatrix(self.X_test, self.y_test), pred_contribs=True)[:,:-1]
 
     @wrapshap_required('wrapshap')
-    def shapRFE(self, surrogate_metrics: bool = False, top: int = None):
+    def shapRFE(self, surrogate_metrics: bool = False, top: int = None, plot:bool = True,time_info:bool = False):
         """
         Simply calls Wrapshap implementation of Recursive Feature Elimination (RFE). 
 
@@ -149,11 +149,13 @@ class WrappedXGB(ABC):
         return self.wrapshap.shapRFE(
             surrogate_metrics=surrogate_metrics,
             top=top,
+            plot = plot,
+            time_info=time_info
         )
     
     
     @wrapshap_required('wrapshap')
-    def shapFFS(self, surrogate_metrics: bool = False, top: int = None):
+    def shapFFS(self, surrogate_metrics: bool = False, top: int = None, plot:bool = True,time_info:bool = True):
         """
         Simply calls Wrapshap implementation of Forward Feature Selection (FFS). 
 
@@ -170,11 +172,13 @@ class WrappedXGB(ABC):
         return self.wrapshap.shapFFS(
             surrogate_metrics=surrogate_metrics,
             top=top,
+            plot = plot,
+            time_info=time_info
         )
     
 
     @wrapshap_required('wrapshap')
-    def shapBFE(self, surrogate_metrics: bool = False, top: int = None):
+    def shapBFE(self, surrogate_metrics: bool = False, top: int = None, plot:bool = True, time_info:bool=False):
         """
         Simply calls Wrapshap implementation of Forward Feature Selection (BFE). 
 
@@ -191,6 +195,8 @@ class WrappedXGB(ABC):
         return self.wrapshap.shapBFE(
             surrogate_metrics=surrogate_metrics,
             top=top,
+            plot = plot,
+            time_info = time_info
         )
     
 

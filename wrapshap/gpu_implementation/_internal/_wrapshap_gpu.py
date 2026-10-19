@@ -9,14 +9,24 @@ and functions that are exported for use in public modules.
 import itertools
 import numpy as np
 import tensorflow as tf
+from graphviz import Digraph
+import uuid
+from IPython.display import display, Image
+from PIL import Image as PILImage
+import io
+import matplotlib.cm as cm
 
+import time
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 from ..._internal._wrapshap import _progress_bar
 
 # ----------------------------------------------------------------------------------------------------------------------
 # Public API - These utilities are used by other modules and re-exported.
 # ----------------------------------------------------------------------------------------------------------------------
 
-def shapFFS(shap_train: np.ndarray, y_pred_train: np.ndarray, feature_names: list, top: int = None):
+def shapFFS(shap_train: np.ndarray, shap_test: np.ndarray, y_pred_train: np.ndarray, y_pred_test: np.ndarray,
+            feature_names: list, top: int = None, plot:bool = True, time_info:bool = True):
     """
     Wrapshap GPU implementation of Forward Feature Selection (FFS). 
 
@@ -33,15 +43,18 @@ def shapFFS(shap_train: np.ndarray, y_pred_train: np.ndarray, feature_names: lis
     """
 
     if top is not None:
-        shap_train, feature_names = _select_top(top, shap_train, feature_names)
+        shap_train, shap_test, feature_names = _select_top(top, shap_train, shap_test, feature_names)
 
     y_pred_train = y_pred_train.reshape(-1,1)
+    if y_pred_test is not None:
+        y_pred_test = y_pred_test.reshape(-1, 1)
     selected_features = []
     n_samples = shap_train.shape[0]
     n_features = len(feature_names)
     results = {}
 
     _progress_bar(0, len(feature_names))
+    t_start = time.perf_counter()
 
     while len(selected_features) < n_features:
         best_score = float('-inf')
@@ -56,96 +69,144 @@ def shapFFS(shap_train: np.ndarray, y_pred_train: np.ndarray, feature_names: lis
 
         X_batches_tensor = tf.constant(np.stack(X_batches, axis=0), dtype=tf.float32)
         y_batches_tensor = tf.constant(np.stack(y_batches, axis=0), dtype=tf.float32)
-        predictions_batches = _process_batch(X_batches_tensor, y_batches_tensor, n_samples)
-
+        predictions_batches, weights_batches = _process_batch(X_batches_tensor, y_batches_tensor, n_samples)
         batch_r2_scores = _calculate_r2(y_batches_tensor, predictions_batches)
-
-        for idx, feature in enumerate([f for f in feature_names if f not in selected_features]):
+        batch_mae_scores = _calculate_mae(y_batches_tensor, predictions_batches)
+        candidate_features = [f for f in feature_names if f not in selected_features]
+        for idx, feature in enumerate(candidate_features):
             if batch_r2_scores[idx].numpy() > best_score:
                 best_score = batch_r2_scores[idx].numpy()
                 best_feature = feature
-                best_metrics = {'train_pred_r2': best_score[0]}
+                best_idx = idx
+                best_metrics = {'train_pred_r2': best_score[0],
+                                'train_mae_scores': batch_mae_scores[idx].numpy()[0]}
+        
+        # --- évaluation test : on réutilise les poids déjà fit sur train pour la combinaison gagnante ---
+        if shap_test is not None and y_pred_test is not None:
+            best_comb = selected_features + [best_feature]
+            best_weights = weights_batches[best_idx:best_idx+1]  # poids de la combinaison gagnante, shape (1, k+1, 1)
+            X_test_best = shap_test[:, [feature_names.index(f) for f in best_comb]]
+            X_test_tensor = tf.constant(X_test_best[np.newaxis, ...], dtype=tf.float32)
+            y_test_tensor = tf.constant(y_pred_test[np.newaxis, ...], dtype=tf.float32)
+            test_predictions = _predict_batch(X_test_tensor, best_weights, shap_test.shape[0])
+            test_r2_score = _calculate_r2(y_test_tensor, test_predictions)
+            test_mae_score = _calculate_mae(y_test_tensor, test_predictions)
+            best_metrics['test_pred_r2'] = test_r2_score[0].numpy()[0]
+            best_metrics['test_mae_scores'] = test_mae_score[0].numpy()[0]
+            
 
         selected_features.append(best_feature)
+        best_metrics['time'] = time.perf_counter() - t_start
         results[len(selected_features)] = best_metrics
 
         _progress_bar(len(selected_features), len(feature_names))
+        
+    if plot :
+        _plot_performance(results, time_info)
 
     return selected_features, results
 
 
-def shapBFE(shap_train: np.ndarray, y_pred_train: np.ndarray, feature_names: list, top: int = None):
+def shapBFE(shap_train: np.ndarray, shap_test: np.ndarray, y_pred_train: np.ndarray, y_pred_test: np.ndarray, 
+            feature_names: list, top: int = None, plot:bool = True, time_info:bool = False):
     """
-    Wrapshap GPU implementation of Forward Feature Selection (BFE). 
-
+    Wrapshap GPU implementation of Backward Feature Elimination (BFE). 
     Parameters:
         shap_train (np.array): The SHAP values for the train set as a 2D array.
+        shap_test (np.array): The SHAP values for the test set as a 2D array.
         y_pred_train (np.array): The complex model predictions for the train set as a 1D array.
+        y_pred_test (np.array): The complex model predictions for the test set as a 1D array.
         feature_names (list): The feature names.
-        top (int): When different than None, instead of performing BFE on all features, perfoms it only on the top 
+        top (int): When different than None, instead of performing BFE on all features, performs it only on the top 
                     features (the ones with biggest mean absolute SHAP values)
-
     Returns:
         tuple[list, dict]: A tuple containing the list of ranked features (from most to least important) and a 
                         dictionary with the corresponding performance metrics.
     """
-
     if top is not None:
-        shap_train, feature_names = _select_top(top, shap_train, feature_names)
-
+        shap_train, shap_test, feature_names = _select_top(top, shap_train, shap_test, feature_names)
     _progress_bar(0, len(feature_names))
-
     selected_features = feature_names.copy()
     removed_features = []
     results = {}
-
     n_samples = shap_train.shape[0]
-
     y_pred_train = y_pred_train.reshape(-1, 1)
-
+    if y_pred_test is not None:
+        y_pred_test = y_pred_test.reshape(-1, 1)
+        
+    t_start = time.perf_counter()
+    
+    # --- étape initiale : toutes les variables ---
     X_full = shap_train[:, [feature_names.index(f) for f in selected_features]]
     y_full = y_pred_train
-    
-    X_full_tensor = tf.constant(X_full.reshape(1, n_samples, -1), dtype=tf.float32)  # Reshape for consistency
-    y_full_tensor = tf.constant(y_full.reshape(1, n_samples, -1), dtype=tf.float32)
-    predictions_full = _process_batch(X_full_tensor, y_full_tensor, n_samples)
-    
-    full_r2_score = _calculate_r2(y_full_tensor, predictions_full)
 
+    X_full_tensor = tf.constant(X_full.reshape(1, n_samples, -1), dtype=tf.float32)
+    y_full_tensor = tf.constant(y_full.reshape(1, n_samples, -1), dtype=tf.float32)
+    predictions_full, weights_full = _process_batch(X_full_tensor, y_full_tensor, n_samples)
+
+    full_r2_score = _calculate_r2(y_full_tensor, predictions_full)
+    full_mae_score = _calculate_mae(y_full_tensor, predictions_full)
     _progress_bar(1, len(feature_names))
-    
-    results[len(selected_features)] = {'train_pred_r2': full_r2_score.numpy()[0][0]}
+
+    full_metrics = {'train_pred_r2': full_r2_score.numpy()[0][0],
+                    'train_pred_mae': full_mae_score.numpy()[0][0]}
+    if shap_test is not None and y_pred_test is not None:
+        X_test_full = shap_test[:, [feature_names.index(f) for f in selected_features]]
+        X_test_full_tensor = tf.constant(X_test_full.reshape(1, shap_test.shape[0], -1), dtype=tf.float32)
+        y_test_full_tensor = tf.constant(y_pred_test.reshape(1, shap_test.shape[0], -1), dtype=tf.float32)
+        test_predictions_full = _predict_batch(X_test_full_tensor, weights_full, shap_test.shape[0])
+        full_metrics['test_pred_r2'] = _calculate_r2(y_test_full_tensor, test_predictions_full).numpy()[0][0]
+        full_metrics['test_pred_mae'] = _calculate_mae(y_test_full_tensor, test_predictions_full).numpy()[0][0]
+        
+    results[len(selected_features)] = full_metrics
 
     while len(selected_features) > 1:
-        batch_combinations = [[feature_names.index(f) for f in selected_features 
-                               if f != feature] for feature in selected_features]
-
-        X_batches = [shap_train[:, combination] for combination in batch_combinations]
-        y_batches = [y_pred_train for _ in batch_combinations]
-
+        batch_combinations_idx = [[feature_names.index(f) for f in selected_features 
+                                   if f != feature] for feature in selected_features]
+        X_batches = [shap_train[:, combination] for combination in batch_combinations_idx]
+        y_batches = [y_pred_train for _ in batch_combinations_idx]
         X_batches_tensor = tf.constant(np.stack(X_batches, axis=0), dtype=tf.float32)
         y_batches_tensor = tf.constant(np.stack(y_batches, axis=0), dtype=tf.float32)
-        predictions_batches = _process_batch(X_batches_tensor, y_batches_tensor, n_samples)
-
+        predictions_batches, weights_batches = _process_batch(X_batches_tensor, y_batches_tensor, n_samples)
         batch_r2_scores = _calculate_r2(y_batches_tensor, predictions_batches)
+        batch_mae_scores = _calculate_mae(y_batches_tensor, predictions_batches)
 
         best_combination_idx = np.argmax(batch_r2_scores.numpy())
         worst_feature = selected_features[best_combination_idx]
+        remaining_features = [f for f in selected_features if f != worst_feature]
 
-        selected_features.remove(worst_feature)
+        iter_metrics = {'train_pred_r2': batch_r2_scores.numpy()[best_combination_idx][0],
+                        'train_pred_mae': batch_mae_scores.numpy()[best_combination_idx][0]}
+
+        # --- évaluation test : on réutilise les poids déjà fit sur train pour la meilleure combinaison ---
+        if shap_test is not None and y_pred_test is not None:
+            best_weights = weights_batches[best_combination_idx:best_combination_idx + 1]
+            X_test_best = shap_test[:, [feature_names.index(f) for f in remaining_features]]
+            X_test_tensor = tf.constant(X_test_best[np.newaxis, ...], dtype=tf.float32)
+            y_test_tensor = tf.constant(y_pred_test[np.newaxis, ...], dtype=tf.float32)
+            test_predictions = _predict_batch(X_test_tensor, best_weights, shap_test.shape[0])
+            iter_metrics['test_pred_r2'] = _calculate_r2(y_test_tensor, test_predictions).numpy()[0][0]
+            iter_metrics['test_pred_mae'] = _calculate_mae(y_test_tensor, test_predictions).numpy()[0][0]
+
+        selected_features = remaining_features
         removed_features.append(worst_feature)
-        results[len(selected_features)] = {'train_pred_r2': batch_r2_scores.numpy()[best_combination_idx][0]}
+        
+        iter_metrics['time'] = time.perf_counter() - t_start
+        
+        results[len(selected_features)] = iter_metrics
+        _progress_bar(len(removed_features) + 1, len(feature_names))
 
-        _progress_bar(len(removed_features)+1, len(feature_names))
-
+    if plot :
+        _plot_performance(results, time_info)
+        
     removed_features.append(selected_features[0])
     removed_features.reverse()
-
     return removed_features, results
 
 
 def shapNCK(
         shap_train: np.ndarray, y_pred_train: np.ndarray,
+        shap_test: np.ndarray, y_pred_test: np.ndarray,
         feature_names: list,
         k: int = 2, 
         batch_size: int = 500, 
@@ -174,12 +235,13 @@ def shapNCK(
     """
 
     if top is not None:
-        shap_train, feature_names = _select_top(top, shap_train, feature_names)
+        shap_train, shap_test, feature_names = _select_top(top, shap_train, shap_test, feature_names)
 
     y_pred_train = y_pred_train.reshape(-1,1)
+    y_pred_test = y_pred_test.reshape(-1,1)
 
     n_samples = shap_train.shape[0]
-    r2_scores = []
+    all_metrics = {}
 
     remaining_features = [feature for feature in feature_names if feature not in selected_features]
     
@@ -193,32 +255,53 @@ def shapNCK(
         
         X_batch_data = np.array([shap_train[:, [feature_names.index(f) for f in selected_features + list(comb)]] 
                                  for comb in batch_combinations])
-        
-        y_batch_data = np.tile(y_pred_train, (len(batch_combinations), 1, 1))
+        X_batch_data_test = np.array([shap_test[:, [feature_names.index(f) for f in selected_features + list(comb)]] 
+                                 for comb in batch_combinations])
+        #X_batch_data_test = X_batch_data_test.reshape(1,shap_test.shape[0],-1)
 
+        y_batch_data = np.tile(y_pred_train, (len(batch_combinations), 1, 1))
+        y_batch_data_test = np.tile(y_pred_test, (len(batch_combinations), 1, 1))
+        
         X_batch = tf.constant(X_batch_data, dtype=tf.float32)
         y_batch = tf.constant(y_batch_data, dtype=tf.float32)
-
-        predictions_batch = _process_batch(X_batch, y_batch, n_samples)
-
+        X_batch_test = tf.constant(X_batch_data_test, dtype = tf.float32)
+        y_batch_test = tf.constant(y_batch_data_test, dtype = tf.float32)
+        
+        predictions_batch, weights = _process_batch(X_batch, y_batch, n_samples)
+        predictions_test = _predict_batch(X_batch_test, weights, shap_test.shape[0])
+        
         batch_r2_scores = _calculate_r2(y_batch, predictions_batch)
-        r2_scores.extend(batch_r2_scores.numpy())
+        test_r2_scores = _calculate_r2(y_batch_test, predictions_test)
+        batch_mae_scores = _calculate_mae(y_batch, predictions_batch)
+        test_mae_scores = _calculate_mae(y_batch_test, predictions_test)
+        
+        full_metrics = {'train_pred_r2' :batch_r2_scores.numpy(),
+                        'test_pred_r2': test_r2_scores.numpy(),
+                        'train_pred_mae': batch_mae_scores.numpy(),
+                        'test_pred_mae': test_mae_scores.numpy()}
 
+        all_metrics[i // batch_size] = full_metrics  # stockage en dict
+        
         print(f"Processed batch {i // batch_size + 1}/{1 + num_combinations // batch_size}")
 
-    r2_scores = [r2[0] for r2 in r2_scores]
-    max_r2_index = np.argmax(r2_scores)
-    best_r2_score = r2_scores[max_r2_index]
+
+    test_r2_flat = []
+    for key in sorted(all_metrics.keys()):
+        test_r2_flat.extend(all_metrics[key]['test_pred_r2'].tolist())
+    test_r2_flat = np.array(test_r2_flat)
+    max_r2_index   = np.argmax(test_r2_flat)
+    best_r2_score  = test_r2_flat[max_r2_index]
     best_feature_combination = feature_combinations[max_r2_index]
 
     print("\nBest R2 Score:", best_r2_score)
     print("Best Feature Combination:", best_feature_combination)
 
-    return best_feature_combination, r2_scores, feature_combinations
+    return best_feature_combination, all_metrics, feature_combinations
 
 
 def shapXFFS(
         shap_train: np.ndarray, y_pred_train: np.ndarray,
+        shap_test: np.ndarray, y_pred_test: np.ndarray,
         feature_names: list,
         n: int,
         max_depth: int,
@@ -253,7 +336,7 @@ def shapXFFS(
     """
 
     if top is not None:
-        shap_train, feature_names = _select_top(top, shap_train, feature_names)
+        shap_train, shap_test, feature_names = _select_top(top, shap_train, shap_test, feature_names)
     
     if selected_features is None:
         selected_features = []
@@ -268,6 +351,9 @@ def shapXFFS(
         return tree
     n_samples = shap_train.shape[0]
     y_pred_train = y_pred_train.reshape(-1,1)
+    if y_pred_test is not None:
+        y_pred_test = y_pred_test.reshape(-1,1)
+        
     feature_scores = []
 
     for feature in feature_names:
@@ -276,42 +362,53 @@ def shapXFFS(
             X_batch = shap_train[:, [feature_names.index(f) for f in current_features]]
             X_batch = X_batch.reshape(1, n_samples, -1) 
             y_batch = y_pred_train.reshape(1, n_samples, -1)
+            
+            X_batch_test = shap_test[:,[feature_names.index(f)for f in current_features]]
+            X_batch_test = X_batch_test.reshape(1,shap_test.shape[0],-1)
+            y_batch_test = y_pred_test.reshape(1,shap_test.shape[0],-1)
+            
+            predictions, weights = _process_batch(tf.constant(X_batch, dtype=tf.float32), tf.constant(y_batch, dtype=tf.float32), n_samples)
+            test_predictions = _predict_batch(tf.constant(X_batch_test,dtype = tf.float32), weights, shap_test.shape[0])
 
-            predictions = _process_batch(tf.constant(X_batch, dtype=tf.float32), tf.constant(y_batch, dtype=tf.float32), n_samples)
             r2_score = _calculate_r2(y_batch, predictions).numpy()
-
-            feature_scores.append((feature, r2_score))
+            test_r2_score = _calculate_r2(y_batch_test, test_predictions).numpy()
+            mae_score = _calculate_mae(y_batch, predictions).numpy()
+            test_mae_score = _calculate_mae(y_batch_test,test_predictions).numpy()
+            
+            feature_scores.append((feature, r2_score, test_r2_score, mae_score, test_mae_score))
 
     best_features = sorted(feature_scores, key=lambda x: x[1], reverse=True)[:n]
 
-    for best_feature, score in best_features:
+    for best_feature, score, test_score, mae_scores, test_mae_scores in best_features:
         new_selected_features = selected_features + [best_feature]
-        
+        metrics = {'train_pred_r2' : score [0][0],
+                   'test_pred_r2': test_score [0][0],
+                   'train_pred_mae': mae_scores[0][0],
+                   'test_pred_mae': test_mae_scores[0][0]}
         if sorted(new_selected_features) in [sorted(seq) for seq in unique_sequences]:
             if best_feature not in tree:
-                tree[best_feature] = {'train_metrics': {'train_pred_r2':score[0][0]}, 'duplicate': 1}
-
+                tree[best_feature] = {'train_metrics': metrics, 'duplicate': 1}
             continue
-        
-        unique_sequences.append(new_selected_features)  
-        
-        if best_feature not in tree:
-            tree[best_feature] = {'train_metrics': {'train_pred_r2':score[0][0]}, 'duplicate': 0}
-        else:
-            
-            tree[best_feature]['duplicate'] = 0
-            
-        if current_depth + 1 < max_depth and len(new_selected_features) < len(feature_names):
 
+        unique_sequences.append(new_selected_features)
+
+        if best_feature not in tree:
+            tree[best_feature] = {'train_metrics': metrics, 'duplicate': 0}
+        else:
+            tree[best_feature]['duplicate'] = 0
+
+        if current_depth + 1 < max_depth and len(new_selected_features) < len(feature_names):
             tree[best_feature]['next_features'] = shapXFFS(
-                shap_train = shap_train,
-                y_pred_train = y_pred_train,
-                feature_names = feature_names,
-                n = n,
-                max_depth = max_depth,
-                selected_features = new_selected_features,
-                current_depth = current_depth + 1,
-                unique_sequences = unique_sequences
+                shap_train=shap_train,
+                shap_test=shap_test,
+                y_pred_train=y_pred_train,
+                y_pred_test=y_pred_test,
+                feature_names=feature_names,
+                n=n,
+                max_depth=max_depth,
+                selected_features=new_selected_features,
+                current_depth=current_depth + 1,
+                unique_sequences=unique_sequences
             )
 
     return tree
@@ -365,13 +462,52 @@ def print_XFFS_tree(
     if export_to_txt:
         with open(filename, 'w') as file:
             file.write(all_branches_text)
+            
+            
+def plot_XFFS_tree (tree: dict, 
+                    metric: str ='train_pred_r2', 
+                    save: bool = False, 
+                    filename: str = 'tree.png'):
 
+    
+    color_map = plt.get_cmap('viridis')
 
+    dot = Digraph(comment='Cluster 0 tree', graph_attr={'dpi': '300'})
+    add_nodes_edges(dot ,tree, metric,parent_name=None, color_map=color_map, min_val=0, max_val=1)
+    png_bytes = dot.pipe(format='png')
+    tree_img = PILImage.open(io.BytesIO(png_bytes)).convert('RGB')
+    
+    # 2. Générer la colorbar seule, à la même hauteur que l'arbre
+    fig, ax = plt.subplots(figsize=(0.5, tree_img.height / 300))  # hauteur ajustée au dpi
+    norm = plt.Normalize(vmin=0, vmax=1)
+    cb = fig.colorbar(cm.ScalarMappable(cmap='viridis', norm=norm), cax=ax)
+    cb.set_label('valeur')  # à adapter selon votre légende
+    
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    buf.seek(0)
+    bar_img = PILImage.open(buf).convert('RGB')
+    
+    # 3. Redimensionner la colorbar pour qu'elle ait la même hauteur que l'arbre
+    bar_img = bar_img.resize(
+        (int(bar_img.width * tree_img.height / bar_img.height), tree_img.height)
+    )
+    
+    # 4. Coller les deux images côte à côte
+    combined = PILImage.new('RGB', (tree_img.width + bar_img.width, tree_img.height), 'white')
+    combined.paste(tree_img, (0, 0))
+    combined.paste(bar_img, (tree_img.width, 0))
+    if save :
+        output_path = filename
+        dot.render(output_path, format='png', view=False)
+    
+    display(combined)
 # ---------------------------------------------------------------------------------------------------------------------
 # Internal Functions - Below are utilities intended only for internal use.
 # ---------------------------------------------------------------------------------------------------------------------
 
-def _select_top(top, shap_train, features):
+def _select_top(top, shap_train, shap_test, features):
     feature_importances = np.sum(np.abs(shap_train), axis=0)
     features_sorted_by_importance = sorted(zip(feature_importances, features), reverse=True)
     top_n_features = [feature for _, feature in features_sorted_by_importance[:top]]
@@ -379,13 +515,14 @@ def _select_top(top, shap_train, features):
 
     columns_to_keep = [features.index(fn) for fn in features_filtered]
     shap_train_filtered = shap_train[:, columns_to_keep]
+    shaps_test_filtered = shap_test[:, columns_to_keep]
 
-    return shap_train_filtered, features_filtered
+    return shap_train_filtered, shaps_test_filtered, features_filtered
 
 
 
 def _calculate_r2(y_true, y_pred):
-    
+
     y_true = tf.cast(y_true, tf.float32)
     y_pred = tf.cast(y_pred, tf.float32)
     
@@ -397,33 +534,186 @@ def _calculate_r2(y_true, y_pred):
 
     return r2_score
 
+def _calculate_mae(y_true, y_pred):
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
+    
+    y_pred = tf.reshape(y_pred, tf.shape(y_true))
+    mae = tf.reduce_mean(tf.abs(y_true - y_pred), axis=1)
+    return mae
 
 def _process_batch(X_batch, y_batch, n_samples):
-
-    lambda_reg = 1.0
-    
-    ones = tf.ones((X_batch.shape[0], n_samples, 1), dtype=tf.float32)
+    lambda_reg = 1
+    X_batch = tf.cast(X_batch, tf.float64)
+    y_batch = tf.cast(y_batch, tf.float64)
+    ones = tf.ones((X_batch.shape[0], n_samples, 1), dtype=tf.float64)
     X_batch = tf.concat([ones, X_batch], axis=2)
-
-    # Compute X^T * X and X^T * y for each regression
     XTX = tf.matmul(X_batch, X_batch, transpose_a=True)
-
-    # Add lambda * I to the diagonal of X^T * X for Ridge regularization
-    lambda_identity = lambda_reg * tf.eye(XTX.shape[-1], batch_shape=[XTX.shape[0]], dtype=tf.float32)
+    lambda_identity = lambda_reg * tf.eye(XTX.shape[-1], batch_shape=[XTX.shape[0]], dtype=tf.float64)
     XTX_regularized = XTX + lambda_identity
-
-    # Compute X^T * y
     XTy = tf.matmul(X_batch, y_batch, transpose_a=True)
-
-    # Solve for the weights: (X^T * X + lambda * I)^{-1} * X^T * y
-
-    #XTy = tf.matmul(X_batch, y_batch, transpose_a=True)
-
-    # Solve for the weights: (X^T * X)^{-1} * X^T * y
     weights = tf.linalg.solve(XTX_regularized, XTy)
-    #weights = tf.linalg.solve(XTX, XTy)
+    predictions = tf.matmul(X_batch, weights)
+    predictions = tf.reshape(predictions, [X_batch.shape[0], n_samples])
+    return tf.cast(predictions,tf.float32), tf.cast(weights, tf.float32)   # <-- on retourne aussi les poids
 
+
+def _predict_batch(X_batch, weights, n_samples):
+    """Applique des poids déjà appris (fit sur train) à de nouvelles données (ex: test)."""
+    X_batch = tf.cast(X_batch, tf.float64)
+    weights = tf.cast(weights, tf.float64)
+    ones = tf.ones((X_batch.shape[0], n_samples, 1), dtype=tf.float64)
+    X_batch = tf.concat([ones, X_batch], axis=2)
     predictions = tf.matmul(X_batch, weights)
     predictions = tf.reshape(predictions, [X_batch.shape[0], n_samples])
 
-    return predictions
+    return tf.cast(predictions,tf.float32)
+
+
+
+### For the Tree Plot
+
+def get_font_color(hex_color, threshold=0.5):
+    # Convert hex to RGB tuple (values between 0 and 1)
+    r, g, b = mcolors.to_rgb(hex_color)
+    # Calculate luminance (a common approximation)
+    luminance = 0.299 * r + 0.587 * g + 0.114 * b
+    # Return white for dark backgrounds, black for light backgrounds
+    return 'white' if luminance < threshold else 'black'
+
+    
+# Function to add nodes and edges with emphasis on nodes where train_pred_r2 >= 0.90
+def add_nodes_edges(graph, current_dict, metric, parent_name, color_map, min_val, max_val, threshold=0.90):
+    for key, value in current_dict.items():
+        node_name = str(uuid.uuid4())  # Generate a unique name for each node
+
+        # Check for train_pred_r2 value and apply color mapping
+        if 'train_metrics' in value:
+            r2 = value['train_metrics'][metric]
+            # Normalize the r2 value to get the color
+            normalized_r2 = (r2 - min_val) / (max_val - min_val)
+            color = color_map(normalized_r2)
+            hex_color = mcolors.to_hex(color)
+            # Determine the best font color based on the node's fill color
+            fontcolor = get_font_color(hex_color)
+            # Emphasize the node if r2 is above the threshold
+            if r2 >= threshold:
+                graph.node(node_name, label=f'{key}\n{r2:.2f}', 
+                           fillcolor=hex_color, fontcolor=fontcolor, 
+                           style='filled', shape='doubleoctagon', 
+                           color='red', penwidth='3')
+            else:
+                graph.node(node_name, label=f'{key}\n{r2:.2f}',
+                           fillcolor=hex_color, fontcolor=fontcolor, 
+                           style='filled')
+        else:
+            graph.node(node_name, label=key)
+
+        if parent_name:
+            graph.edge(parent_name, node_name)
+
+        # Recursively process next features
+        if 'next_features' in value:
+            add_nodes_edges(graph, value['next_features'],metric, node_name, color_map, min_val, max_val, threshold)
+
+# Extract all r2 values from the nested dictionary for color mapping
+def extract_r2_values(nested_dict, r2_values, metric):
+    for key, value in nested_dict.items():
+        if 'train_metrics' in value:
+            r2_values.append(value['train_metrics'][metric])
+        if 'next_features' in value:
+            extract_r2_values(value['next_features'], r2_values, metric)
+            
+def _plot_performance(perfs, time_info = True):
+    n_features_list = []
+    r2_list         = []
+    time_list       = []
+    
+    alpha = 1
+    beta= 0.1
+
+    
+    
+    for n_feat, values in perfs.items():
+        n_features_list.append(int(n_feat))
+        for metric, value in values.items():
+            if metric == 'test_pred_r2':
+                r2_list.append(value)
+            if metric == 'time':
+                time_list.append(value)
+    
+    # Trier par nombre de features
+    order        = np.argsort(n_features_list)
+    n_features   = np.array(n_features_list)[order]
+    r2_scores    = np.array(r2_list)[order]
+    time_scores  = np.array(time_list)[order]
+        
+    def normalize(x):
+        x = np.array(x, dtype=float)
+        return (x - x.min()) / (x.max() - x.min() + 1e-9)
+    
+    #r2_norm = normalize(r2_scores)          # on veut maximiser -> reste tel quel
+    nf_norm = normalize(n_features)         # on veut minimiser
+    time_norm = normalize(time_scores)      # on veut minimiser
+    
+    fig, ax = plt.subplots(figsize=(8, 4))
+    fs_scores = []
+    for nf, r2, t in zip(nf_norm, r2_scores, time_norm):
+        fs_scores.append((r2*alpha - beta*nf))
+    
+    fs_scores = np.array(fs_scores)
+    # -------------------------------------------------------
+    # AXE 1 — R²
+    # -------------------------------------------------------
+    
+    ax.plot(n_features, r2_scores,
+            color='steelblue', linewidth=2,
+            marker='o', markersize=5, zorder=3, label='Test R²', )
+    ax.fill_between(n_features, r2_scores, alpha=0.08, color='steelblue')
+    
+    best_idx = np.argmax(fs_scores)
+    ax.scatter(n_features[best_idx], r2_scores[best_idx],
+               color='steelblue', zorder=4, s=60, marker='D',
+               label=f'FS_score={fs_scores[best_idx]:.3f} ({n_features[best_idx]} features)')
+    
+    ax.set_xlabel('Number of selected features', fontsize=12)
+    ax.set_ylabel('Test R²', fontsize=12, color='black')
+    ax.tick_params(axis='y', labelcolor='black', labelsize = 8)
+    ax.spines['top'].set_visible(False)
+    
+    # -------------------------------------------------------
+    # AXE 2 — Computation time
+    # -------------------------------------------------------
+    if time_info :
+        ax2 = ax.twinx()  # partage le même axe x
+        ax2.plot(n_features, time_scores,
+                 color='coral', linewidth=2, linestyle='--',
+                 marker='s', markersize=4, zorder=2, label='Cumulative computation time')
+        
+        ax2.set_ylabel('Cumulative computation time (s)', fontsize=12, color='black')
+        ax2.tick_params(axis='y', labelcolor='black', labelsize = 8)
+        ax2.spines['top'].set_visible(False)
+    
+    # -------------------------------------------------------
+    # LÉGENDE COMBINÉE
+    # -------------------------------------------------------
+    
+    lines1, labels1 = ax.get_legend_handles_labels()
+    if time_info == True :
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2, fontsize = 10, framealpha=0.5, loc ='lower right' )
+    else :
+        ax.legend(lines1, labels1, fontsize = 10, framealpha=0.5, loc ='lower right' )
+    
+    ax.set_title('Feature selection — performance vs. parsimony trade-off',
+                 fontsize=12)
+    if len(n_features) > 25:
+        ax.set_xticks(n_features[::2])
+        ax.set_xticklabels(n_features[::2], rotation=45, fontsize=10)
+    if len(n_features) <= 25:
+        ax.set_xticks(n_features)
+        ax.set_xticklabels(n_features, rotation=45, fontsize=10)
+    ax.tick_params(labelsize=10)
+    
+    plt.tight_layout()
+    plt.show()

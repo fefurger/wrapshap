@@ -27,7 +27,7 @@ setup(
     ],
     extras_require={
         'gpu': [
-            'tensorflow>=2.16.1'
+            'tensorflow>=2.16.1, <=2.20'
         ]
     },
     license="Apache-2.0",
