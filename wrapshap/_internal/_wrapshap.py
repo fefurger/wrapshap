@@ -14,6 +14,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 from sklearn.metrics import r2_score, mean_absolute_error
 from scipy.special import expit
+import matplotlib.pyplot as plt
+from time import time
 
 # ----------------------------------------------------------------------------------------------------------------------
 # Public API - These utilities are used by other modules and re-exported.
@@ -26,7 +28,9 @@ def shapRFE(
         feature_names: list,
         surrogate_metrics: bool = False,
         top: int = None,
-        task_type: str = 'classification'
+        task_type: str = 'classification',
+        plot : bool = True,
+        time_info : bool = False
 ) -> tuple:
     """
     Wrapshap implementation of Recursive Feature Elimination (RFE). 
@@ -62,7 +66,7 @@ def shapRFE(
     shap_test_normalized = scaler.transform(shap_test)
 
     _progress_bar(0, len(feature_names), mode='ascending')
-
+    start_time = time()
     while remaining_features:
 
         model = LinearRegression()
@@ -85,6 +89,8 @@ def shapRFE(
             results[len(remaining_features)][f'test_{key}'] = metrics_test[key]
         for key in metrics_train:
             results[len(remaining_features)][f'train_{key}'] = metrics_train[key]
+            
+        results[len(remaining_features)]['time']=time() - start_time
 
         min_importance_index = np.argmin(np.abs(model.coef_))
         removed_feature = remaining_features.pop(min_importance_index)
@@ -93,6 +99,9 @@ def shapRFE(
         _progress_bar(len(removed_features), len(feature_names), mode='ascending')
 
     removed_features.reverse()
+    
+    if plot :
+        _plot_performance(results, time_info)
     return removed_features, results
 
 
@@ -102,7 +111,9 @@ def shapFFS(
         feature_names: list,
         surrogate_metrics: bool = False,
         top: int = None,
-        task_type: str = 'classification'
+        task_type: str = 'classification',
+        plot: bool = True,
+        time_info: bool = True
 ) -> tuple:
     """
     Wrapshap implementation of Forward Feature Selection (FFS). 
@@ -133,6 +144,7 @@ def shapFFS(
     results = {}
 
     _progress_bar(0, len(feature_names), mode='ascending')
+    start_time = time()
 
     while len(selected_features) < n_features:
         best_score = float('-inf')
@@ -164,6 +176,7 @@ def shapFFS(
                         best_metrics[f'test_{key}'] = metrics_test[key]
                     for key in metrics_train:
                         best_metrics[f'train_{key}'] = metrics_train[key]
+                    best_metrics['time']=time() - start_time
 
 
         selected_features.append(best_feature)
@@ -181,6 +194,8 @@ def shapFFS(
             top=top,
             task_type=task_type
         )
+    if plot :
+        _plot_performance(results, time_info)
 
     return selected_features, results
 
@@ -191,7 +206,9 @@ def shapBFE(
         feature_names: list,
         surrogate_metrics: bool = False,
         top: int = None,
-        task_type: str = 'classification'
+        task_type: str = 'classification',
+        plot: bool = True,
+        time_info: bool = False
 ) -> tuple:
     """
     Wrapshap implementation of Backward Feature Elimination (BFE). 
@@ -222,10 +239,11 @@ def shapBFE(
     results = {}
 
     _progress_bar(0, len(feature_names), mode='ascending')
+    start_time = time()
 
     model = LinearRegression()
     model.fit(shap_train, y_pred_train)
-
+    
     lnr_predictions_train = model.predict(shap_train)
     lnr_predictions_test = model.predict(shap_test)
 
@@ -237,9 +255,9 @@ def shapBFE(
         results[len(selected_features)][f'test_{key}'] = metrics_test[key]
     for key in metrics_train:
         results[len(selected_features)][f'train_{key}'] = metrics_train[key]
-    
-    _progress_bar(1, len(feature_names), mode='ascending')
+    results[len(selected_features)]['time'] = time() - start_time
 
+    _progress_bar(1, len(feature_names), mode='ascending')
     while len(selected_features) > 1:
         worst_score = float('-inf')
         worst_feature = None
@@ -267,6 +285,8 @@ def shapBFE(
                     worst_metrics[f'test_{key}'] = metrics_test[key]
                 for key in metrics_train:
                     worst_metrics[f'train_{key}'] = metrics_train[key]
+                worst_metrics['time'] = time() - start_time
+
 
         selected_features.remove(worst_feature)
         removed_features.append(worst_feature)
@@ -287,6 +307,8 @@ def shapBFE(
             top=top,
             task_type=task_type
         )
+    if plot :
+        _plot_performance(results, time_info)
 
     return removed_features, results
 
@@ -318,6 +340,7 @@ def get_surrogate_metrics(
     """
     
     _progress_bar(0, len(feature_ranking), mode='ascending', suffix='Complete (surrogate metrics computation)')
+    start_time = time()
     for i in range(1, len(feature_ranking)+1):
 
         model = LinearRegression()
@@ -339,6 +362,8 @@ def get_surrogate_metrics(
             metrics_dict[i][f'test_{key}'] = metrics_test[key]
         for key in metrics_train:
             metrics_dict[i][f'train_{key}'] = metrics_train[key]
+            metrics_dict[i]['time'] = time() - start_time
+
         _progress_bar(i, len(feature_ranking), mode='ascending', suffix='Complete (surrogate metrics computation)')
     
     return metrics_dict
@@ -405,3 +430,96 @@ def _calculate_metrics(y_true, lnr_predictions, model_predictions, task_type, su
         metrics = _surrogate_metrics(y_true, lnr_predictions, task_type, metrics)
     
     return metrics
+
+def _plot_performance(perfs, time_info = True):
+    n_features_list = []
+    r2_list         = []
+    time_list       = []
+    
+    alpha = 1
+    beta= 0.2
+    
+    
+    for n_feat, values in perfs.items():
+        n_features_list.append(int(n_feat))
+        for metric, value in values.items():
+            if metric == 'test_pred_r2':
+                r2_list.append(value)
+            if metric == 'time':
+                time_list.append(value)
+    
+    # Trier par nombre de features
+    order        = np.argsort(n_features_list)
+    n_features   = np.array(n_features_list)[order]
+    r2_scores    = np.array(r2_list)[order]
+    time_scores  = np.array(time_list)[order]
+        
+    def normalize(x):
+        x = np.array(x, dtype=float)
+        return (x - x.min()) / (x.max() - x.min() + 1e-9)
+    
+    #r2_norm = normalize(r2_scores)          # on veut maximiser -> reste tel quel
+    nf_norm = normalize(n_features)         # on veut minimiser
+    time_norm = normalize(time_scores)      # on veut minimiser
+    
+    fig, ax = plt.subplots(figsize=(8, 4))
+    fs_scores = []
+    for nf, r2, t in zip(nf_norm, r2_scores, time_norm):
+        fs_scores.append((r2*alpha - beta*nf))
+    
+    fs_scores = np.array(fs_scores)
+    # -------------------------------------------------------
+    # AXE 1 — R²
+    # -------------------------------------------------------
+    
+    ax.plot(n_features, r2_scores,
+            color='steelblue', linewidth=2,
+            marker='o', markersize=5, zorder=3, label='Test R²', )
+    ax.fill_between(n_features, r2_scores, alpha=0.08, color='steelblue')
+    
+    best_idx = np.argmax(fs_scores)
+    ax.scatter(n_features[best_idx], r2_scores[best_idx],
+               color='steelblue', zorder=4, s=60, marker='D',
+               label=f'FS_score={fs_scores[best_idx]:.3f} ({n_features[best_idx]} features)')
+    
+    ax.set_xlabel('Number of selected features', fontsize=12)
+    ax.set_ylabel('Test R²', fontsize=12, color='black')
+    ax.tick_params(axis='y', labelcolor='black', labelsize = 8)
+    ax.spines['top'].set_visible(False)
+    
+    # -------------------------------------------------------
+    # AXE 2 — Computation time
+    # -------------------------------------------------------
+    if time_info :
+        ax2 = ax.twinx()  # partage le même axe x
+        ax2.plot(n_features, time_scores,
+                 color='coral', linewidth=2, linestyle='--',
+                 marker='s', markersize=4, zorder=2, label='Cumulative computation time')
+        
+        ax2.set_ylabel('Cumulative computation time (s)', fontsize=12, color='black')
+        ax2.tick_params(axis='y', labelcolor='black', labelsize = 8)
+        ax2.spines['top'].set_visible(False)
+    
+    # -------------------------------------------------------
+    # LÉGENDE COMBINÉE
+    # -------------------------------------------------------
+    
+    lines1, labels1 = ax.get_legend_handles_labels()
+    if time_info == True :
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2, fontsize = 10, framealpha=0.5, loc ='lower right' )
+    else :
+        ax.legend(lines1, labels1, fontsize = 10, framealpha=0.5, loc ='lower right' )
+    
+    ax.set_title('Feature selection — performance vs. parsimony trade-off',
+                 fontsize=12)
+    if len(n_features) > 25:
+        ax.set_xticks(n_features[::2])
+        ax.set_xticklabels(n_features[::2], rotation=45, fontsize=10)
+    if len(n_features) <= 25:
+        ax.set_xticks(n_features)
+        ax.set_xticklabels(n_features, rotation=45, fontsize=10)
+    ax.tick_params(labelsize=10)
+    
+    plt.tight_layout()
+    plt.show()
