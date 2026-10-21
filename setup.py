@@ -6,7 +6,7 @@ README = Path(__file__).parent / "README_PyPI.md"
 
 setup(
     name='wrapshap',
-    version='0.1.1',
+    version='0.1.2',
     author='Félix Furger',
     author_email='fefurger@hotmail.com',
     description='SHAP-based feature selection and exploration for high-dimensional data',
